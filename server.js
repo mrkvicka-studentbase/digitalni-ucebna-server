@@ -56,14 +56,40 @@ const AI_SYSTEM_PROMPT =
     'výsledky ani postupy neuváděj, pokud si je učitel výslovně nevyžádá; ' +
     'maximálně 10 bloků.';
 
-// Modely seřazené od nejúspornějšího — když jeden narazí na limit (429)
-// nebo neexistuje (404), zkusí se automaticky další v pořadí.
-const AI_MODELS = [
+// Záložní seznam, kdyby se nepodařilo načíst modely od Googlu
+const AI_MODELS_FALLBACK = [
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
     'gemini-2.5-flash-lite',
-    'gemini-2.0-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-2.0-flash'
+    'gemini-2.5-flash'
 ];
+
+// Zjistíme, které textové "flash" modely má klíč k dispozici.
+// Lite verze přednostně (nejštědřejší free tier), novější verze první.
+let cachedModels = null;
+let cachedModelsAt = 0;
+
+async function getAvailableModels(apiKey) {
+    const now = Date.now();
+    if (cachedModels && (now - cachedModelsAt) < 60 * 60 * 1000) return cachedModels;
+    try {
+        const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=' + apiKey);
+        const out = await r.json();
+        const list = (out.models || [])
+            .map(m => (m.name || '').replace('models/', ''))
+            .filter(n => /^gemini-\d+(\.\d+)?-flash(-lite)?$/.test(n));
+        if (list.length === 0) return AI_MODELS_FALLBACK;
+        const version = n => parseFloat(n.match(/^gemini-(\d+(\.\d+)?)/)[1]);
+        const isLite = n => n.endsWith('-lite') ? 1 : 0;
+        list.sort((a, b) => (isLite(b) - isLite(a)) || (version(b) - version(a)));
+        cachedModels = list;
+        cachedModelsAt = now;
+        console.log('Dostupné AI modely (v pořadí zkoušení): ' + list.join(', '));
+        return list;
+    } catch (e) {
+        return AI_MODELS_FALLBACK;
+    }
+}
 
 app.post('/ai', async (req, res) => {
     try {
@@ -77,7 +103,8 @@ app.post('/ai', async (req, res) => {
         let lastError = null;
         let usedModel = null;
 
-        for (const model of AI_MODELS) {
+        const models = await getAvailableModels(apiKey);
+        for (const model of models) {
             const r = await fetch(
                 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey,
                 {
