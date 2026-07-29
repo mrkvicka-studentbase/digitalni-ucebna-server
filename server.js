@@ -51,8 +51,9 @@ const AI_SYSTEM_PROMPT =
     'Odpověz VÝHRADNĚ platným JSON objektem ve tvaru {"widgets": ["...", "..."]} — nic jiného. ' +
     'Každá položka pole "widgets" je jeden samostatný blok, který se objeví na tabuli (typicky jeden příklad). ' +
     'Pravidla obsahu: piš česky a stručně; povolené HTML značky jsou pouze <b>, <i>, <u>, <br>, <span>, <sub>, <sup>; ' +
-    'zlomky zapisuj VÝHRADNĚ ve tvaru \\frac{citatel}{jmenovatel}, odmocniny jako \\sqrt{...}, mocniny jako x^2; ' +
-    'žádné jiné LaTeXové příkazy a žádné znaky $ nepoužívej; ' +
+    'zlomky zapisuj VÝHRADNĚ ve tvaru {citatel}/{jmenovatel} — např. {3}/{4}; ' +
+    'odmocniny jako sqrt{...}, mocniny jako x^2; ' +
+    'NIKDY nepoužívej zpětné lomítko, LaTeXové příkazy ani znak $; ' +
     'příklady čísluj (<b>1)</b> ...); ' +
     'výsledky ani postupy neuváděj, pokud si je učitel výslovně nevyžádá; ' +
     'maximálně 10 bloků.';
