@@ -94,8 +94,16 @@ async function getAvailableModels(apiKey) {
     }
 }
 
+// Kontrola učitelského PINu (nastav na Renderu proměnnou TEACHER_PIN)
+function checkPin(req) {
+    const required = process.env.TEACHER_PIN;
+    if (!required) return true; // PIN není nastaven → bez ochrany
+    return String((req.body && req.body.pin) || '') === required;
+}
+
 app.post('/ai', async (req, res) => {
     try {
+        if (!checkPin(req)) return res.json({ ok: false, error: 'Neplatný učitelský PIN — nastav ho v panelu Moji žáci.' });
         const prompt = String((req.body && req.body.prompt) || '').slice(0, 2000);
         if (!prompt) return res.json({ ok: false, error: 'Chybí zadání.' });
 
@@ -166,6 +174,7 @@ const AI_CHECK_PROMPT =
 
 app.post('/ai-check', async (req, res) => {
     try {
+        if (!checkPin(req)) return res.json({ ok: false, error: 'Neplatný učitelský PIN — nastav ho v panelu Moji žáci.' });
         const image = String((req.body && req.body.image) || '');
         if (!image) return res.json({ ok: false, error: 'Chybí obrázek.' });
 
