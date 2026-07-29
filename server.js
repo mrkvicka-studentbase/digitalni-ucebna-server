@@ -56,6 +56,15 @@ const AI_SYSTEM_PROMPT =
     'výsledky ani postupy neuváděj, pokud si je učitel výslovně nevyžádá; ' +
     'maximálně 10 bloků.';
 
+// Modely seřazené od nejúspornějšího — když jeden narazí na limit (429)
+// nebo neexistuje (404), zkusí se automaticky další v pořadí.
+const AI_MODELS = [
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash'
+];
+
 app.post('/ai', async (req, res) => {
     try {
         const prompt = String((req.body && req.body.prompt) || '').slice(0, 2000);
@@ -64,26 +73,43 @@ app.post('/ai', async (req, res) => {
         const apiKey = process.env.GEMINI_API_KEY;
         if (!apiKey) return res.json({ ok: false, error: 'Na serveru není nastaven GEMINI_API_KEY.' });
 
-        const r = await fetch(
-            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + apiKey,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    systemInstruction: { parts: [{ text: AI_SYSTEM_PROMPT }] },
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: { responseMimeType: 'application/json', temperature: 0.7 }
-                })
-            }
-        );
-        const out = await r.json();
+        let text = null;
+        let lastError = null;
+        let usedModel = null;
 
-        const text = out && out.candidates && out.candidates[0]
-            && out.candidates[0].content && out.candidates[0].content.parts
-            && out.candidates[0].content.parts[0] && out.candidates[0].content.parts[0].text;
-        if (!text) {
-            return res.json({ ok: false, error: 'AI nevrátila odpověď. Detail: ' + JSON.stringify(out).slice(0, 300) });
+        for (const model of AI_MODELS) {
+            const r = await fetch(
+                'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        systemInstruction: { parts: [{ text: AI_SYSTEM_PROMPT }] },
+                        contents: [{ parts: [{ text: prompt }] }],
+                        generationConfig: { responseMimeType: 'application/json', temperature: 0.7 }
+                    })
+                }
+            );
+            const out = await r.json();
+
+            if (out && out.error) {
+                // 429 = vyčerpaný limit, 404 = model neexistuje → zkusíme další model
+                lastError = 'Model ' + model + ': ' + (out.error.message || out.error.code);
+                console.log('AI model ' + model + ' selhal (' + out.error.code + '), zkouším další...');
+                continue;
+            }
+
+            const t = out && out.candidates && out.candidates[0]
+                && out.candidates[0].content && out.candidates[0].content.parts
+                && out.candidates[0].content.parts[0] && out.candidates[0].content.parts[0].text;
+            if (t) { text = t; usedModel = model; break; }
+            lastError = 'Model ' + model + ' nevrátil text.';
         }
+
+        if (!text) {
+            return res.json({ ok: false, error: 'Žádný model teď není dostupný. Poslední chyba: ' + String(lastError).slice(0, 300) });
+        }
+        console.log('AI odpověděl model: ' + usedModel);
 
         let parsed;
         try { parsed = JSON.parse(text); }
