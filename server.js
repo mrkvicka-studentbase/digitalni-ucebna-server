@@ -225,6 +225,70 @@ app.post('/ai-check', async (req, res) => {
     }
 });
 
+// ===== AI ČTENÍ FUNKCE PRO GRAF =====
+const AI_GRAPH_PROMPT =
+    'Na obrázku z digitální tabule je zápis matematické funkce (např. y = x^2 - 2x + 1, f(x) = 2/x, y = sin x). ' +
+    'Přečti ji a odpověz VÝHRADNĚ platným JSON objektem: ' +
+    '{"funkce": "čitelný zápis, např. f(x) = x² − 2x + 1", ' +
+    '"expr": "JavaScriptový výraz s proměnnou x — POUZE čísla, x, + - * / ( ) a funkce sin( cos( tan( sqrt( abs( log( exp( pow( ; mocniny zapisuj jako x*x nebo pow(x,3)", ' +
+    '"vlastnosti": {"definicni_obor": "...", "obor_hodnot": "...", "sudost_lichost": "sudá / lichá / ani jedno", "monotonie": "kde roste a kde klesá", "dalsi": "průsečíky s osami, vrchol, asymptoty (stručně)"}} ' +
+    'Vše česky a stručně. Pokud na obrázku žádná funkce není, vrať {"error": "popis problému"}.';
+
+app.post('/ai-graph', async (req, res) => {
+    try {
+        if (!checkPin(req)) return res.json({ ok: false, error: 'Neplatný učitelský PIN — nastav ho v Nastavení.' });
+        const image = String((req.body && req.body.image) || '');
+        if (!image) return res.json({ ok: false, error: 'Chybí obrázek.' });
+
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) return res.json({ ok: false, error: 'Na serveru není nastaven GEMINI_API_KEY.' });
+
+        const models = await getAvailableModels(apiKey);
+        let text = null, lastError = null;
+
+        for (const model of models) {
+            const r = await fetch(
+                'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        systemInstruction: { parts: [{ text: AI_GRAPH_PROMPT }] },
+                        contents: [{ parts: [
+                            { inline_data: { mime_type: 'image/jpeg', data: image } },
+                            { text: 'Přečti funkci na obrázku.' }
+                        ] }],
+                        generationConfig: { responseMimeType: 'application/json', temperature: 0.2 }
+                    })
+                }
+            );
+            const out = await r.json();
+            if (out && out.error) { lastError = 'Model ' + model + ': ' + (out.error.message || out.error.code); continue; }
+            const t = out && out.candidates && out.candidates[0]
+                && out.candidates[0].content && out.candidates[0].content.parts
+                && out.candidates[0].content.parts[0] && out.candidates[0].content.parts[0].text;
+            if (t) { text = t; break; }
+            lastError = 'Model ' + model + ' nevrátil text.';
+        }
+
+        if (!text) return res.json({ ok: false, error: 'Žádný model teď není dostupný: ' + String(lastError).slice(0, 300) });
+
+        let parsed;
+        try { parsed = JSON.parse(text); }
+        catch (e) { return res.json({ ok: false, error: 'AI vrátila neplatný formát.' }); }
+        if (parsed.error) return res.json({ ok: false, error: String(parsed.error) });
+
+        res.json({
+            ok: true,
+            funkce: String(parsed.funkce || ''),
+            expr: String(parsed.expr || ''),
+            vlastnosti: parsed.vlastnosti || {}
+        });
+    } catch (err) {
+        res.json({ ok: false, error: String(err) });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server naslouchá na portu ${PORT}`);
