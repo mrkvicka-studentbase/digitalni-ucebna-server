@@ -424,6 +424,107 @@ app.post('/ai', async (req, res) => {
     }
 });
 
+// =============================================================================
+// AI NÁVRH DOMÁCÍHO ÚKOLU
+// =============================================================================
+// Volá to REZERVAČNÍ APLIKACE ze svého serveru, ne tabule z prohlížeče: lektor
+// dopíše zápis po lekci a chce k probranému učivu příklady na doma.
+//
+// PROČ VLASTNÍ ADRESA A NE `/ai`:
+//   `AI_SYSTEM_PROMPT` je psaný pro tabuli — vrací pole `widgets`, uvnitř má
+//   HTML značky (<b>1)</b>) a zlomky ve tvaru {3}/{4}, kterému rozumí jedině
+//   vykreslovač tabule. V zadání domácího úkolu, které si rodič přečte
+//   v aplikaci i v e-mailu, by to byla nečitelná změť. Odpověď tady je proto
+//   HOLÝ TEXT bez jediné značky.
+//   `/ai` se nemění ani o čárku, aby tabule fungovala přesně jako dosud.
+//
+// KDO SMÍ: totéž co u `/ai` — platná vstupenka s rolí `ucitel` a stropy na
+// počet volání. Žákovský lístek server odmítne.
+
+const AI_UKOL_PROMPT =
+    'Jsi zkušený doučovatel a připravuješ DOMÁCÍ ÚKOL pro jednoho žáka po odučené lekci. ' +
+    'Dostaneš téma lekce, poznámky lektora z té hodiny a někdy i ročník žáka. ' +
+    'Nejdůležitější pravidlo: příklady musí být PŘESNĚ na to, co je v poznámkách, a na nic jiného. ' +
+    'Když lektor probral sčítání, odčítání a násobení zlomků, dej příklady na sčítání, odčítání a násobení zlomků — ' +
+    'žádné dělení, žádné převody na desetinná čísla, žádné rozšiřování učiva. ' +
+    'Obtížnost přizpůsob ročníku; když ročník nedostaneš, mysli na střed základní školy. ' +
+    'Odpověz VÝHRADNĚ platným JSON objektem ve tvaru {"nazev": "...", "priklady": ["...", "..."]} — nic jiného. ' +
+    '"nazev" je krátký název úkolu do 60 znaků, který popisuje učivo (např. "Zlomky — sčítání, odčítání a násobení"). ' +
+    '"priklady" je 5 až 8 položek a každá je JEDEN samostatný příklad k vypracování, nanejvýš dvě věty. ' +
+    'Pokrytí: když poznámky uvádějí víc dovedností, rozděl příklady mezi ně rovnoměrně a u každého ať je poznat, které dovednosti se týká. ' +
+    'Zápis: piš česky a POUZE HOLÝM TEXTEM — žádné HTML značky, žádný Markdown, žádné hvězdičky, žádné zpětné lomítko, žádný LaTeX a žádný znak $. ' +
+    'Zlomky zapisuj jako 3/4, smíšená čísla jako 2 1/2, mocniny jako x^2, odmocniny jako sqrt(9). ' +
+    'Položky NEČÍSLUJ, číslování si doplní aplikace sama. ' +
+    'Výsledky ani postup neuváděj — úkol je pro žáka. ' +
+    'Když jsou poznámky tak stručné, že z nich nejde poznat, co se probíralo, vrať místo toho ' +
+    '{"error": "jedna česká věta o tom, co má lektor do poznámek doplnit"}.';
+
+app.post('/ai-ukol', async (req, res) => {
+    try {
+        if (!povolAi(req, res)) return;
+        // Pokyn nese téma i poznámky z hodiny, takže je delší než dotaz na tabuli.
+        const prompt = String((req.body && req.body.prompt) || '').slice(0, 4000);
+        if (!prompt) return res.json({ ok: false, error: 'Chybí zadání.' });
+
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) return res.json({ ok: false, error: 'Na serveru není nastaven GEMINI_API_KEY.' });
+
+        const models = await getAvailableModels(apiKey);
+        let text = null, lastError = null, usedModel = null;
+
+        for (const model of models) {
+            const r = await fetch(
+                'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        systemInstruction: { parts: [{ text: AI_UKOL_PROMPT }] },
+                        contents: [{ parts: [{ text: prompt }] }],
+                        // Nižší teplota než u tabule: úkol, který si přečte rodič,
+                        // má být spíš nudně správný než nápaditý.
+                        generationConfig: { responseMimeType: 'application/json', temperature: 0.4 }
+                    })
+                }
+            );
+            const out = await r.json();
+
+            if (out && out.error) {
+                lastError = 'Model ' + model + ': ' + (out.error.message || out.error.code);
+                console.log('AI návrh úkolu — model ' + model + ' selhal (' + out.error.code + '), zkouším další...');
+                continue;
+            }
+
+            const t = out && out.candidates && out.candidates[0]
+                && out.candidates[0].content && out.candidates[0].content.parts
+                && out.candidates[0].content.parts[0] && out.candidates[0].content.parts[0].text;
+            if (t) { text = t; usedModel = model; break; }
+            lastError = 'Model ' + model + ' nevrátil text.';
+        }
+
+        if (!text) {
+            return res.json({ ok: false, error: 'Žádný model teď není dostupný. Poslední chyba: ' + String(lastError).slice(0, 300) });
+        }
+        console.log('AI návrh úkolu — odpověděl model: ' + usedModel);
+
+        let parsed;
+        try { parsed = JSON.parse(text); }
+        catch (e) { return res.json({ ok: false, error: 'AI vrátila neplatný formát, zkus to znovu.' }); }
+
+        // AI sama řekla, že z poznámek nepozná, co se probíralo.
+        if (parsed && parsed.error) return res.json({ ok: false, error: String(parsed.error).slice(0, 300) });
+
+        const priklady = Array.isArray(parsed.priklady)
+            ? parsed.priklady.map(p => String(p)).filter(p => p.trim()).slice(0, 10)
+            : [];
+        if (priklady.length === 0) return res.json({ ok: false, error: 'AI nevrátila žádné příklady, zkus to znovu.' });
+
+        res.json({ ok: true, nazev: String(parsed.nazev || ''), priklady: priklady });
+    } catch (err) {
+        res.json({ ok: false, error: String(err) });
+    }
+});
+
 // ===== AI KONTROLA VÝPOČTU Z OBRÁZKU =====
 const AI_CHECK_PROMPT =
     'Jsi laskavý učitel při doučování. Na obrázku je zadání příkladu a žákův postup či výpočet z digitální tabule. ' +
