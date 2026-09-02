@@ -9,7 +9,10 @@ const WebSocket = require('ws');
 // Instalovat tedy není co, `npm install` zůstává beze změny.
 
 const app = express();
-app.use(express.json({ limit: '8mb' }));
+// 12 MB, protože přes `/disk` teče i PDF se zápisem z hodiny. Osm megabajtů
+// stačilo, dokud se posílaly jen tahy na tabuli; delší hodina se do nich
+// nevejde a odmítnutí by přišlo bez vysvětlení.
+app.use(express.json({ limit: '12mb' }));
 
 // CORS — aby aplikace mohla volat /ai odkudkoli (lokální soubor i budoucí subdoména)
 app.use((req, res, next) => {
@@ -74,7 +77,12 @@ function podpisySedi(a, b) {
  * nutné — ale rozlišit prošlý lístek od podvrženého se hodí, jinak by rodič
  * nevěděl, jestli má počkat, nebo si otevřít aplikaci znovu.
  */
-function overVstupenku(token) {
+/**
+ * @param token   podepsaný lístek
+ * @param odklad  o kolik vteřin se smí být po vypršení. Nula všude kromě
+ *                ukládání zápisu na Disk — proč, viz `/disk`.
+ */
+function overVstupenku(token, odklad) {
     const tajemstvi = process.env.UCEBNA_SECRET;
     if (!tajemstvi) {
         return {
@@ -121,7 +129,7 @@ function overVstupenku(token) {
     if (ted + TOLERANCE_HODIN_S < obsah.nbf) {
         return { ok: false, duvod: 'brzy', hlaska: 'Učebna se otevře až deset minut před začátkem lekce. Zkus to prosím za chvíli.' };
     }
-    if (ted - TOLERANCE_HODIN_S > obsah.exp) {
+    if (ted - TOLERANCE_HODIN_S > obsah.exp + (Number(odklad) || 0)) {
         return { ok: false, duvod: 'prosly', hlaska: 'Lekce už skončila a odkaz do učebny propadl.' };
     }
 
@@ -215,6 +223,95 @@ setInterval(() => {
 // Kontrolní stránka
 app.get('/', (req, res) => {
     res.send('Mozek digitální učebny běží a je připraven na spojení!');
+});
+
+// =============================================================================
+// GOOGLE DISK — PRŮCHOD NA APPS SCRIPT
+// =============================================================================
+// Tabule volávala Apps Script na Googlu PŘÍMO z prohlížeče a ten `doPost` se
+// nikoho na nic neptal: kdo znal jeho adresu, psal lektorovi na Disk a posílal
+// poštu jeho jménem. A adresu znal každý žák — učitelská tabule mu ji sama
+// posílala po WebSocketu.
+//
+// Průchod tady tu díru zavírá třemi věcmi najednou:
+//
+//   1. ADRESA SKRIPTU ZŮSTÁVÁ NA SERVERU. Do prohlížečů se nedostane.
+//   2. TAJEMSTVÍ. Ke skriptu se přidá `secret`; Apps Script bez něj neudělá nic,
+//      takže ani ten, kdo adresu odněkud vyhrabe, s ní nepořídí.
+//   3. MÍSTNOST SI SERVER DOSADÍ SÁM ze vstupenky. Kdyby ji bral z požadavku,
+//      stačilo by přepsat jméno místnosti a číst cizí hodiny.
+//
+// KDO CO SMÍ: žák jenom se svou místností (`loadRoom`, `saveRoom`) — to dělá
+// stejně tím, že kreslí. Archiv a ukládání PDF je lektorské.
+//
+// NA RENDERU JE POTŘEBA NASTAVIT:
+//   UCEBNA_SCRIPT_URL    — adresa /exec z nasazeného Apps Scriptu
+//   UCEBNA_SCRIPT_SECRET — tatáž hodnota jako SCRIPT_SECRET ve skriptu
+
+/** Akce, ke kterým se žák nedostane. */
+const DISK_JEN_UCITEL = new Set(['archiveSave', 'archiveList', 'archiveLoad', 'savePdf']);
+
+/** Všechno, co smí projít. Co tu není, server odmítne. */
+const DISK_POVOLENE = new Set(['loadRoom', 'saveRoom', ...DISK_JEN_UCITEL]);
+
+app.post('/disk', async (req, res) => {
+    try {
+        const akce = String((req.body && req.body.action) || '');
+
+        /*
+          ODKLAD U ZÁPISU. Lístek propadá čtvrt hodiny po konci lekce, jenže
+          PDF se ukládá až po ní — a sestavit se ho chvíli sestavuje. Bez
+          odkladu by rodině zápis odešel (o tom rozhodují Rezervace, které
+          odklad mají taky), ale na Disku by tiše nepřistál nic.
+
+          Platí JEN pro `savePdf`. Do místnosti ani k AI se s prošlým lístkem
+          nikdo nedostane — tam by delší platnost znamenala cizí hodinu.
+        */
+        const odklad = akce === 'savePdf' ? 6 * 60 * 60 : 0;
+        const overeni = overVstupenku(req.body && req.body.t, odklad);
+        if (!overeni.ok) return res.json({ ok: false, error: overeni.hlaska });
+        if (!DISK_POVOLENE.has(akce)) return res.json({ ok: false, error: 'Neznámá akce.' });
+
+        const jeUcitel = overeni.obsah.role === 'ucitel';
+        if (DISK_JEN_UCITEL.has(akce) && !jeUcitel) {
+            return res.json({ ok: false, error: 'Tohle smí jen lektor.' });
+        }
+
+        const url = process.env.UCEBNA_SCRIPT_URL;
+        const secret = process.env.UCEBNA_SCRIPT_SECRET;
+        if (!url || !secret) {
+            // Mlčet by bylo horší: ukládání by tiše přestalo fungovat.
+            console.log('Disk odmítnut: chybí UCEBNA_SCRIPT_URL nebo UCEBNA_SCRIPT_SECRET.');
+            return res.json({ ok: false, error: 'Ukládání na Disk není na serveru nastavené.' });
+        }
+
+        /*
+          Ze žádosti se přebírá jen to, co je vyjmenované. Kdyby se posílala
+          celá, dal by se `room` nebo `secret` podstrčit zvenčí.
+        */
+        const telo = { action: akce, secret: secret, room: overeni.obsah.room };
+        if (typeof req.body.state === 'string') telo.state = req.body.state;
+        if (typeof req.body.student === 'string') telo.student = req.body.student.slice(0, 120);
+        if (typeof req.body.name === 'string') telo.name = req.body.name.slice(0, 200);
+        if (typeof req.body.id === 'string') telo.id = req.body.id;
+        if (akce === 'savePdf') {
+            telo.filename = String(req.body.filename || 'zapis.pdf').slice(0, 200);
+            telo.lesson = String(req.body.lesson || '').slice(0, 200);
+            telo.date = String(req.body.date || '').slice(0, 20);
+            telo.pdfBase64 = String(req.body.pdfBase64 || '');
+        }
+
+        const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(telo)
+        });
+        const out = await r.json();
+        res.json(out);
+    } catch (err) {
+        console.log('Disk selhal: ' + String(err));
+        res.json({ ok: false, error: 'Disk teď neodpovídá.' });
+    }
 });
 
 // ===== AI ASISTENT (Gemini) =====
