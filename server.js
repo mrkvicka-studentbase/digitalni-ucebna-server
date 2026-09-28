@@ -29,12 +29,36 @@ const server = http.createServer(app);
   zpráva položí bezplatný Render (512 MB RAM) a s ním všechny běžící lekce.
   Kreslicí zprávy mají stovky bajtů, obrázek na pozadí jde jako data URL
   v řádu stovek kB — 512 kB je s rezervou.
+
+  Na tuhle hodnotu je navázaná tabule: dosynchronizaci po výpadku
+  (`sync-state`) dělí na části pod SYNC_CAST_MAX_B. Kdo strop sníží, musí
+  snížit i tu — jinak by přerostlá odpověď spojení zavřela, protistrana by se
+  znovu připojila, znovu požádala o stav a točilo by se to dokola.
 */
 const MAX_ZPRAVA_B = 512 * 1024;
 const wss = new WebSocket.Server({ server, maxPayload: MAX_ZPRAVA_B });
 
-/** Kolik zpráv za vteřinu ještě bereme od jednoho spojení. Kreslení jich dělá desítky. */
-const MAX_ZPRAV_ZA_S = 200;
+/*
+  Kolik zpráv za vteřinu ještě bereme od jednoho spojení.
+
+  Dřív 200 — a to bylo na hraně: iPad s ProMotion hlásí pohyb tužky až 120×
+  za vteřinu a starší tabule posílala zprávu `draw` za každý, k tomu kurzor
+  25× za vteřinu a ostatní provoz (tahy, stránky, hovor). Stačilo, aby Wi-Fi
+  na chvilku zadrhla a pak zprávy dorazily naráz, a rychle píšící žák byl
+  odpojen — což vypadá jako zaseknutá, nebo po konci lekce rovnou vypnutá
+  učebna. Nová tabule posílá `draw` nejvýš ~60× za vteřinu, ale stará karta
+  může být pořád otevřená.
+
+  Brzda je tu proti záplavě (cizí kód, zacyklený skript), ne proti člověku,
+  který rychle píše. 500 dává víc než trojnásobnou rezervu nad nejhustší
+  poctivý provoz a záplavu pořád zastaví.
+*/
+const MAX_ZPRAV_ZA_S = 500;
+/**
+ * Do jaké délky se parsují i učitelovy zprávy (kvůli `presence`, viz obsluha
+ * zpráv). `presence` má pár desítek bajtů, kreslicí zpráva stovky.
+ */
+const MAX_PARSOVAT_UCITEL_B = 512;
 /** Kolik spojení smí běžet na jednu vstupenku. Dvě zařízení plus rezerva. */
 const MAX_SPOJENI_NA_LISTEK = 4;
 
@@ -282,17 +306,58 @@ wss.on("connection", (ws, req) => {
           složenou závorkou nebo jiné pořadí klíčů. Teď se zpráva rozparsuje;
           na stovkách bajtů kreslicí zprávy je to zanedbatelné, a co se
           rozparsovat nedá, se nepřeposílá — protistrana by to stejně zahodila.
+
+          Učitelovy zprávy se dřív neparsovaly vůbec. Teď se parsují ty krátké
+          (do MAX_PARSOVAT_UCITEL_B), aby server poznal `presence` i od učitele
+          — velký podklad (stovky kB) se kvůli tomu převádět nemusí.
         */
-    if (ws.role !== "ucitel") {
-      let typ = "";
+    let typ = "";
+    let obsah = null;
+    const delka = typeof message === "string" ? message.length : message.length || 0;
+    if (ws.role !== "ucitel" || delka <= MAX_PARSOVAT_UCITEL_B) {
       try {
         const text = typeof message === "string" ? message : message.toString("utf8");
-        const obsah = JSON.parse(text);
+        obsah = JSON.parse(text);
         typ = obsah && typeof obsah.type === "string" ? obsah.type : "";
       } catch (e) {
-        return;
+        obsah = null;
+        typ = "";
       }
-      if (!typ || JEN_UCITEL.has(typ)) return;
+    }
+    if (ws.role !== "ucitel" && (!typ || JEN_UCITEL.has(typ))) return;
+
+    // `pong` posílá jedině server (viz níž). Kdyby ho přeposílal, dal by se
+    // protistraně podstrčit a přesvědčit ji, že je spojení živé.
+    if (typ === "pong") return;
+
+    /*
+          HLÍDAČ MRTVÉHO SPOJENÍ. iPad, který se vrátí z pozadí, má často
+          spojení, které hlásí „otevřeno", ale nic jím neteče. Tabule to pozná
+          jedině tak, že se zeptá a čeká na odpověď — a odpovědět musí server,
+          ne protistrana (ta tam být nemusí).
+
+          Odpovídá se jen na `presence` s polem `ping`. Starší tabule `ping`
+          neposílá, takže `pong` nikdy nedostane: jinak by si ho vyložila jako
+          zprávu od protistrany (`peerSeen`) a ukazovala by „Učitel online",
+          i když učitel dávno odešel.
+
+          `ping` se vrací beze změny — tabule podle něj ví, které své zprávy
+          server prokazatelně přijal. `druhych` = kolik dalších spojení je teď
+          v místnosti: zpráva přeposlaná do prázdné místnosti je pro protistranu
+          ztracená a tabule ji musí považovat za nedoručenou. Server tím
+          nezačíná držet stav tabule, jen spočítá, kdo je připojený.
+        */
+    if (typ === "presence" && obsah && obsah.ping !== undefined) {
+      let druhych = 0;
+      wss.clients.forEach((c) => {
+        if (c !== ws && c.readyState === WebSocket.OPEN && c.room === ws.room) druhych++;
+      });
+      const ping = Number.isFinite(obsah.ping) ? obsah.ping : 0;
+      try {
+        ws.send(JSON.stringify({ type: "pong", ping: ping, druhych: druhych }));
+      } catch (e) {
+        /* spojení se právě zavírá, na přeposlání níž to nic nemění */
+      }
     }
 
     wss.clients.forEach((client) => {
